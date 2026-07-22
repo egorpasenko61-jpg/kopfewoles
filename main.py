@@ -31,7 +31,7 @@ from aiogram.types import KeyboardButton, Message, ReplyKeyboardMarkup
 
 # ─────────────────────────────── НАСТРОЙКИ ───────────────────────────────
 BOT_TOKEN = os.getenv("BOT_TOKEN") or "8795825447:AAF1votifPkVRkDOVMCsqCa8d-BYDunSw-w"
-ADMIN_CHAT_ID = os.getenv("ADMIN_CHAT_ID")  # опционально
+ADMIN_CHAT_ID = os.getenv("7521801228")  # опционально
 
 SCRIPT_DIR = Path(__file__).parent
 DATA_DIR = SCRIPT_DIR / "submissions"
