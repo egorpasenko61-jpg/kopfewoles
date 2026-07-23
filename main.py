@@ -23,6 +23,7 @@ from pathlib import Path
 from aiogram import Bot, Dispatcher, F, Router, types
 from aiogram.client.default import DefaultBotProperties
 from aiogram.enums import ParseMode
+from aiogram.exceptions import TelegramAPIError, TelegramForbiddenError, TelegramRetryAfter
 from aiogram.filters import Command, StateFilter
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
@@ -31,11 +32,26 @@ from aiogram.types import KeyboardButton, Message, ReplyKeyboardMarkup
 
 # ─────────────────────────────── НАСТРОЙКИ ───────────────────────────────
 BOT_TOKEN = os.getenv("BOT_TOKEN") or "8795825447:AAF1votifPkVRkDOVMCsqCa8d-BYDunSw-w"
-ADMIN_CHAT_ID = os.getenv("ADMIN_CHAT_ID") or "7521801228"
+
+# Можно указать несколько админов через запятую: ADMIN_CHAT_ID=7521801228,111222333
+_admin_raw = os.getenv("ADMIN_CHAT_ID") or "7521801228"
+ADMIN_CHAT_IDS: list[int] = []
+for _part in _admin_raw.split(","):
+    _part = _part.strip()
+    if not _part:
+        continue
+    try:
+        ADMIN_CHAT_IDS.append(int(_part))
+    except ValueError:
+        pass  # не число — молча пропускаем, а не роняем весь бот
 
 SCRIPT_DIR = Path(__file__).parent
 DATA_DIR = SCRIPT_DIR / "submissions"
 DATA_DIR.mkdir(exist_ok=True)
+# Сюда пишется КАЖДАЯ неудачная попытка отправить заявку админу — с точным
+# текстом ошибки Telegram, чтобы проблему можно было найти без доступа к
+# консоли/логам сервиса.
+DELIVERY_ERRORS_LOG = SCRIPT_DIR / "delivery_errors.log"
 
 # Имя файла, которое увидит пользователь при скачивании ТЗ
 TECH_TASK_FILENAME = "tech_task.docx"
@@ -4670,23 +4686,82 @@ def save_submission(kind: str, payload: dict) -> None:
 
 _admin_warned = False
 
-async def notify_admin(bot: Bot, kind: str, payload: dict) -> None:
+
+def _log_delivery_error(admin_id: int, kind: str, reason: str) -> None:
+    """Пишет неудачную попытку доставки в отдельный файл — так проблему видно
+    даже без доступа к консоли/systemd-логам процесса."""
+    stamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    line = f"[{stamp}] admin_id={admin_id} kind={kind!r} error={reason}\n"
+    try:
+        with open(DELIVERY_ERRORS_LOG, "a", encoding="utf-8") as f:
+            f.write(line)
+    except Exception as e:
+        log.error("Не удалось записать %s: %s", DELIVERY_ERRORS_LOG, e)
+
+
+async def _send_to_admin(bot: Bot, admin_id: int, text: str) -> bool:
+    """Отправляет одному админу с одним повтором при флуд-контроле Telegram.
+    Возвращает True при успехе. Все ошибки логируются с понятной причиной —
+    самая частая: получатель ни разу не писал боту (/start), и Telegram
+    запрещает боту первым начинать диалог — это ограничение платформы,
+    решается только тем, что получатель сам откроет бота и нажмёт «Старт»."""
+    for attempt in range(2):
+        try:
+            await bot.send_message(admin_id, text, parse_mode=ParseMode.HTML)
+            return True
+        except TelegramRetryAfter as e:
+            if attempt == 0:
+                log.warning("Флуд-контроль Telegram, повтор через %s сек.", e.retry_after)
+                await asyncio.sleep(e.retry_after + 1)
+                continue
+            _log_delivery_error(admin_id, "retry_after", str(e))
+            return False
+        except TelegramForbiddenError as e:
+            reason = (
+                f"{e} — получатель {admin_id} ни разу не писал боту (/start) "
+                f"или заблокировал его. Попросите этого человека открыть бота "
+                f"и нажать «Старт» — без этого Telegram не пропустит сообщения."
+            )
+            log.error("Не удалось отправить заявку админу %s: %s", admin_id, reason)
+            _log_delivery_error(admin_id, "forbidden", reason)
+            return False
+        except TelegramAPIError as e:
+            log.error("Не удалось отправить заявку админу %s: %s", admin_id, e)
+            _log_delivery_error(admin_id, "api_error", str(e))
+            return False
+        except Exception as e:
+            log.error("Непредвиденная ошибка отправки админу %s: %s", admin_id, e)
+            _log_delivery_error(admin_id, "unexpected", str(e))
+            return False
+    return False
+
+
+async def notify_admin(bot: Bot, kind: str, payload: dict) -> bool:
+    """Рассылает заявку всем ID из ADMIN_CHAT_IDS. Возвращает True, если хотя
+    бы один админ получил сообщение — так и создатель заявки (через
+    save_submission) не теряется, если Telegram не доставил ни одному."""
     global _admin_warned
-    if not ADMIN_CHAT_ID:
+    if not ADMIN_CHAT_IDS:
         if not _admin_warned:
             log.warning(
-                "ADMIN_CHAT_ID не задан — заявки админу не отправляются. "
-                "Установите переменную окружения ADMIN_CHAT_ID=<chat_id>"
+                "ADMIN_CHAT_ID не задан или некорректен — заявки никому не отправляются. "
+                "Установите переменную окружения ADMIN_CHAT_ID=<chat_id>[,<chat_id>...]"
             )
             _admin_warned = True
-        return
+        return False
+
     text = f"📥 Новая заявка: {kind}\n\n" + "\n".join(
         f"• {k}: <b>{v}</b>" for k, v in payload.items()
     )
-    try:
-        await bot.send_message(int(ADMIN_CHAT_ID), text, parse_mode=ParseMode.HTML)
-    except Exception as e:
-        log.warning("Не удалось отправить заявку админу: %s", e)
+    results = [await _send_to_admin(bot, admin_id, text) for admin_id in ADMIN_CHAT_IDS]
+    delivered = any(results)
+    if not delivered:
+        log.error(
+            "ЗАЯВКА НЕ ДОСТАВЛЕНА НИ ОДНОМУ АДМИНУ (%s). Подробности — в %s. "
+            "Заявка при этом сохранена локально в %s.",
+            ADMIN_CHAT_IDS, DELIVERY_ERRORS_LOG, DATA_DIR,
+        )
+    return delivered
 
 
 async def cancel_handler(message: Message, state: FSMContext) -> None:
@@ -4727,12 +4802,27 @@ router = Router(name="adjuvo")
 @router.message(Command("start"))
 async def cmd_start(message: Message, state: FSMContext) -> None:
     await state.clear()
+    log.info("/start от chat_id=%s (%s)", message.chat.id, message.from_user.full_name if message.from_user else "?")
     await message.answer(
         "Добро пожаловать в <b>AdjuvoCRM</b> — я ваш помощник, "
         "и я рад, что вы заглянули.\n\n"
         "Выберите, что вас интересует:",
         parse_mode=ParseMode.HTML,
         reply_markup=main_menu_kb(),
+    )
+
+
+@router.message(Command("myid"))
+async def cmd_myid(message: Message) -> None:
+    """Диагностика: показывает точный chat_id этого чата — именно его нужно
+    прописывать в ADMIN_CHAT_ID. Важно и по другой причине: пока получатель
+    ни разу не написал боту, Telegram не разрешает боту писать ему первым —
+    команда /myid как раз и открывает диалог с нужной стороны."""
+    is_admin = message.chat.id in ADMIN_CHAT_IDS
+    status = "✅ этот chat_id уже настроен как админ" if is_admin else "⚠️ этот chat_id НЕ в списке администраторов"
+    await message.answer(
+        f"Ваш chat_id: <code>{message.chat.id}</code>\n{status}",
+        parse_mode=ParseMode.HTML,
     )
 
 
@@ -5034,6 +5124,27 @@ async def main() -> None:
     on_disk = SCRIPT_DIR / "assets" / "tech_task.docx"
     src = "диск: assets/tech_task.docx" if on_disk.is_file() else "встроенный base64"
     log.info("Источник ТЗ: %s", src)
+
+    # ── Самопроверка доставки при каждом старте ──
+    # Не ждём первую реальную заявку, чтобы узнать, работает ли отправка —
+    # пробуем сразу и громко пишем в лог результат для каждого админа.
+    if ADMIN_CHAT_IDS:
+        for admin_id in ADMIN_CHAT_IDS:
+            ok = await _send_to_admin(
+                bot, admin_id,
+                "✅ Бот AdjuvoCRM запущен. Заявки будут приходить сюда.",
+            )
+            if ok:
+                log.info("Самопроверка: доставка админу %s работает.", admin_id)
+            else:
+                log.error(
+                    "Самопроверка: админ %s НЕ получил тестовое сообщение — "
+                    "см. причину выше и файл %s. Обычно это значит, что этот "
+                    "chat_id ни разу не писал боту /start.",
+                    admin_id, DELIVERY_ERRORS_LOG,
+                )
+    else:
+        log.warning("ADMIN_CHAT_ID не задан — некому слать заявки.")
 
     await dp.start_polling(bot)
 
